@@ -19,6 +19,9 @@ type BotStats struct {
 	GoVersion         string  `json:"go_version"`
 	BotUsername       string  `json:"bot_username"`
 	BotAvatar         string  `json:"bot_avatar"`
+	IsOnline          bool    `json:"is_online"`
+	ConnectedAt       string  `json:"connected_at,omitempty"`
+	LastDisconnectAt  string  `json:"last_disconnect_at,omitempty"`
 }
 
 // Channel represents a text/voice channel in a guild

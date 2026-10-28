@@ -25,13 +25,25 @@ type BotService struct {
 	messagesProcessed int64
 	isReady           bool
 	verifyMu          sync.Mutex
+
+	// Connection tracking
+	stateMu           sync.Mutex
+	isOnline          bool
+	connectedAt       time.Time
+	lastDisconnectAt  time.Time
+	lastReportedState string
+	lastReportedAt    time.Time
+	interactionsOnce  sync.Once
 }
 
 func New(cfg *config.Config, st *store.Store) *BotService {
+	now := time.Now()
 	return &BotService{
-		cfg:       cfg,
-		store:     st,
-		startTime: time.Now(),
+		cfg:         cfg,
+		store:       st,
+		startTime:   now,
+		connectedAt: now,
+		isOnline:    cfg.IsDemoMode,
 	}
 }
 
@@ -51,6 +63,9 @@ func (b *BotService) Start() error {
 
 	// Handlers
 	dg.AddHandler(b.handleReady)
+	dg.AddHandler(b.handleConnect)
+	dg.AddHandler(b.handleDisconnect)
+	dg.AddHandler(b.handleResumed)
 	dg.AddHandler(b.handleMessageCreate)
 	dg.AddHandler(b.handleGuildMemberAdd)
 
@@ -87,9 +102,170 @@ func (b *BotService) Start() error {
 }
 
 func (b *BotService) Stop() {
-	if b.session != nil {
+	b.stateMu.Lock()
+	now := time.Now()
+	nowStr := now.Format("15:04:05")
+	uptimeStr := formatDuration(time.Since(b.startTime))
+	b.isOnline = false
+	b.lastReportedState = "offline"
+	b.stateMu.Unlock()
+
+	if b.session != nil && b.isReady {
+		guildIDs := []string{}
+		if b.session.State != nil && len(b.session.State.Guilds) > 0 {
+			for _, g := range b.session.State.Guilds {
+				guildIDs = append(guildIDs, g.ID)
+			}
+		} else {
+			guildIDs = append(guildIDs, "1564174536029507635")
+		}
+
+		for _, guildID := range guildIDs {
+			b.SendAdminReport(guildID, "🔴 บอทหยุดการทำงาน (Offline)",
+				"บอทหวานน้อย ปิดระบบการทำงานเรียบร้อย",
+				[]*discordgo.MessageEmbedField{
+					{
+						Name:   "🕒 เวลาที่หยุดทำงาน",
+						Value:  fmt.Sprintf("`%s`", nowStr),
+						Inline: true,
+					},
+					{
+						Name:   "⏱️ เวลาทำงานต่อเนื่อง (Uptime)",
+						Value:  fmt.Sprintf("`%s`", uptimeStr),
+						Inline: true,
+					},
+				},
+				0xEF4444,
+			)
+			b.store.AddAuditLog(guildID, "BOT_OFFLINE", "ระบบบอท",
+				fmt.Sprintf("บอทหยุดทำงานเมื่อเวลา %s (Uptime: %s)", nowStr, uptimeStr))
+		}
+
+		time.Sleep(800 * time.Millisecond)
 		_ = b.session.Close()
 	}
+}
+
+func (b *BotService) handleConnect(s *discordgo.Session, c *discordgo.Connect) {
+	b.stateMu.Lock()
+	b.isOnline = true
+	b.stateMu.Unlock()
+	log.Println("🟢 [Gateway] Connected to Discord WebSocket")
+}
+
+func (b *BotService) handleDisconnect(s *discordgo.Session, d *discordgo.Disconnect) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+
+	// Only process if we were currently online to avoid duplicate disconnect logs
+	if b.isOnline {
+		b.isOnline = false
+		b.lastDisconnectAt = time.Now()
+		nowStr := b.lastDisconnectAt.Format("15:04:05")
+		log.Printf("⚠️ [Gateway] Lost connection to Discord at %s", nowStr)
+
+		if b.session != nil && b.session.State != nil {
+			for _, g := range b.session.State.Guilds {
+				b.store.AddAuditLog(g.ID, "BOT_DISCONNECT", "ระบบบอท",
+					fmt.Sprintf("บอทขาดการเชื่อมต่อ (Lost Connect) เมื่อเวลา %s", nowStr))
+			}
+		}
+	}
+}
+
+func (b *BotService) handleResumed(s *discordgo.Session, r *discordgo.Resumed) {
+	log.Println("🔄 [Gateway] Resumed connection to Discord")
+	b.notifyConnectionStatus(s, "resumed")
+}
+
+func (b *BotService) notifyConnectionStatus(s *discordgo.Session, eventSource string) {
+	b.stateMu.Lock()
+	now := time.Now()
+	nowStr := now.Format("15:04:05")
+
+	// If already online and reported recently (within 10s), do not duplicate ("event แต่ละอย่างให้แสดงแค่ครั้งเดียวพอ")
+	if b.lastReportedState == "online" && time.Since(b.lastReportedAt) < 10*time.Second {
+		b.stateMu.Unlock()
+		return
+	}
+
+	wasDisconnected := !b.lastDisconnectAt.IsZero()
+	disconnectTimeStr := ""
+	offlineDurationStr := ""
+	if wasDisconnected {
+		disconnectTimeStr = b.lastDisconnectAt.Format("15:04:05")
+		offlineDurationStr = formatDuration(now.Sub(b.lastDisconnectAt))
+	}
+
+	b.connectedAt = now
+	b.isOnline = true
+	b.lastReportedState = "online"
+	b.lastReportedAt = now
+	b.lastDisconnectAt = time.Time{}
+	b.stateMu.Unlock()
+
+	go func() {
+		// Wait 1.5 seconds to make sure channel permissions & roles are ready
+		time.Sleep(1500 * time.Millisecond)
+
+		guildIDs := []string{}
+		if s.State != nil && len(s.State.Guilds) > 0 {
+			for _, g := range s.State.Guilds {
+				guildIDs = append(guildIDs, g.ID)
+			}
+		} else {
+			guildIDs = append(guildIDs, "1564174536029507635")
+		}
+
+		for _, guildID := range guildIDs {
+			if wasDisconnected {
+				// Reconnection report (เมื่อกลับมาต่อได้หลังหลุด)
+				b.SendAdminReport(guildID, "🟢 บอทกลับมาออนไลน์แล้ว (Reconnected)",
+					"ระบบเชื่อมต่อกลับเข้า Discord Gateway สำเร็จหลังขาดการเชื่อมต่อ",
+					[]*discordgo.MessageEmbedField{
+						{
+							Name:   "🕒 ขาดการเชื่อมต่อไปตอน",
+							Value:  fmt.Sprintf("`%s`", disconnectTimeStr),
+							Inline: true,
+						},
+						{
+							Name:   "🟢 กลับมาออนไลน์ตอน",
+							Value:  fmt.Sprintf("`%s`", nowStr),
+							Inline: true,
+						},
+						{
+							Name:   "⏱️ ออฟไลน์ไปนาน",
+							Value:  fmt.Sprintf("`%s`", offlineDurationStr),
+							Inline: true,
+						},
+					},
+					0x22C55E,
+				)
+				b.store.AddAuditLog(guildID, "BOT_RECONNECTED", "ระบบบอท",
+					fmt.Sprintf("กลับมาออนไลน์เมื่อ %s (หลุดไปตอน %s นาน %s)", nowStr, disconnectTimeStr, offlineDurationStr))
+			} else {
+				// Initial online report (ออนไลน์ครั้งแรก)
+				b.SendAdminReport(guildID, "🟢 บอทออนไลน์ (Online)",
+					"บอทหวานน้อย พร้อมทำงานในเซิร์ฟเวอร์เรียบร้อย",
+					[]*discordgo.MessageEmbedField{
+						{
+							Name:   "🕒 เวลาที่ออนไลน์",
+							Value:  fmt.Sprintf("`%s`", nowStr),
+							Inline: true,
+						},
+						{
+							Name:   "🤖 สถานะ",
+							Value:  "`ออนไลน์พร้อมใช้งาน`",
+							Inline: true,
+						},
+					},
+					0x22C55E,
+				)
+				b.store.AddAuditLog(guildID, "BOT_ONLINE", "ระบบบอท",
+					fmt.Sprintf("บอทออนไลน์เมื่อเวลา %s", nowStr))
+			}
+		}
+	}()
 }
 
 // EnsureReportChannel finds or creates a locked channel named 'รายงาน' visible ONLY to administrators & bot
@@ -462,7 +638,11 @@ func (b *BotService) handleReady(s *discordgo.Session, r *discordgo.Ready) {
 		}
 	}()
 
-	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Notify connection status to #รายงาน (only once per state change)
+	b.notifyConnectionStatus(s, "ready")
+
+	b.interactionsOnce.Do(func() {
+		s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		// 1. Slash Commands Handler
 		if i.Type == discordgo.InteractionApplicationCommand {
 			data := i.ApplicationCommandData()
@@ -598,6 +778,7 @@ func (b *BotService) handleReady(s *discordgo.Session, r *discordgo.Ready) {
 				b.processMemberVerification(s, i.Interaction, "button")
 			}
 		}
+	})
 	})
 }
 
@@ -1237,6 +1418,22 @@ func (b *BotService) GetStats() models.BotStats {
 		atomic.AddInt64(&b.messagesProcessed, 1)
 	}
 
+	b.stateMu.Lock()
+	isOnline := b.isOnline || (b.isReady && b.session != nil)
+	var connectedAtStr string
+	if !b.connectedAt.IsZero() {
+		connectedAtStr = b.connectedAt.Format("15:04:05")
+	}
+	var lastDisconnectStr string
+	if !b.lastDisconnectAt.IsZero() {
+		lastDisconnectStr = b.lastDisconnectAt.Format("15:04:05")
+	}
+	b.stateMu.Unlock()
+
+	if !isOnline {
+		status = "offline"
+	}
+
 	return models.BotStats{
 		Status:            status,
 		IsDemo:            b.cfg.IsDemoMode,
@@ -1253,6 +1450,9 @@ func (b *BotService) GetStats() models.BotStats {
 		GoVersion:         runtime.Version(),
 		BotUsername:       botName,
 		BotAvatar:         botAvatar,
+		IsOnline:          isOnline,
+		ConnectedAt:       connectedAtStr,
+		LastDisconnectAt:  lastDisconnectStr,
 	}
 }
 
