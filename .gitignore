@@ -1,0 +1,11 @@
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+.env
+data.json
+.DS_Store
+node_modules/
+*.log
